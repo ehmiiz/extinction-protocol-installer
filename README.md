@@ -55,19 +55,6 @@ bash install.sh --install-dir "$HOME/Games"
 Use the same custom folder on future updates. `--check` prepares the installer if
 needed, but doesn't install the game.
 
-**The game won't launch. What now?**  
-Run it in a terminal to see the error:
-
-```sh
-"$HOME/Applications/Extinction-Protocol.AppImage"
-```
-
-For a FUSE error, install `fuse2` or launch without it:
-
-```sh
-"$HOME/Applications/Extinction-Protocol.AppImage" --appimage-extract-and-run
-```
-
 **How do I uninstall?**  
 Open the Omarchy menu (**Super + Alt + Space**), search for **Extinction Protocol**,
 press **Delete**, then select **Uninstall** and press **Enter**.
