@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -24,6 +25,12 @@ ASSET = {
     "digest": "sha256:" + CHECKSUM,
 }
 RELEASE = {"tag_name": "v0.14.1", "assets": [ASSET]}
+
+
+class DownloadResponse(io.BytesIO):
+    def __init__(self, data, include_length=True):
+        super().__init__(data)
+        self.headers = {"Content-Length": str(len(data))} if include_length else {}
 
 
 def make_archive(path, entries):
@@ -175,7 +182,7 @@ class FileTests(unittest.TestCase):
         data = b"downloaded bytes"
         checksum = hashlib.sha256(data).hexdigest()
         destination = self.root / "cache" / checksum
-        with patch("install.request", return_value=io.BytesIO(data)) as request:
+        with patch("install.request", return_value=DownloadResponse(data)) as request:
             install.download("https://example.invalid/asset", destination, checksum)
             install.download("https://example.invalid/asset", destination, checksum)
             request.assert_called_once()
@@ -185,7 +192,7 @@ class FileTests(unittest.TestCase):
     def test_corrupt_cache_is_redownloaded(self):
         destination = self.root / "download"
         destination.write_bytes(b"corrupt")
-        with patch("install.request", return_value=io.BytesIO(b"correct")):
+        with patch("install.request", return_value=DownloadResponse(b"correct")):
             install.download(
                 "https://example.invalid/asset", destination, hashlib.sha256(b"correct").hexdigest()
             )
@@ -193,13 +200,85 @@ class FileTests(unittest.TestCase):
 
     def test_checksum_mismatch_and_network_errors_leave_no_partial_file(self):
         destination = self.root / "download"
-        with patch("install.request", return_value=io.BytesIO(b"bad")):
+        with patch("install.request", return_value=DownloadResponse(b"bad")):
             with self.assertRaises(install.InstallError):
                 install.download("https://example.invalid/asset", destination, CHECKSUM)
         with patch("install.request", side_effect=OSError("offline")):
             with self.assertRaises(OSError):
                 install.download("https://example.invalid/asset", destination, CHECKSUM)
         self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_download_progress_tracks_bytes_with_known_or_unknown_size(self):
+        data = b"x" * (2 * 1024 * 1024 + 7)
+        for include_length in (True, False):
+            with self.subTest(include_length=include_length):
+                destination = self.root / f"download-{include_length}"
+                with patch("install.request", return_value=DownloadResponse(data, include_length)):
+                    with patch("install.Progress") as progress_class:
+                        progress = progress_class.return_value.__enter__.return_value
+                        install.download("https://example.invalid/asset", destination)
+                self.assertEqual(destination.read_bytes(), data)
+                self.assertEqual(
+                    progress.add_task.call_args.kwargs["total"],
+                    len(data) if include_length else None,
+                )
+                self.assertEqual(
+                    sum(call.kwargs.get("advance", 0) for call in progress.update.call_args_list),
+                    len(data),
+                )
+                self.assertEqual(progress.update.call_args.kwargs["completed"], len(data))
+
+    def test_incomplete_download_is_reported_and_cleaned_up(self):
+        response = DownloadResponse(b"short")
+        response.headers["Content-Length"] = "100"
+        with patch("install.request", return_value=response):
+            with self.assertRaisesRegex(install.InstallError, "Incomplete download"):
+                install.download("https://example.invalid/asset", self.root / "download")
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_build_failures_include_captured_tool_diagnostics(self):
+        tool = self.root / "appimagetool"
+        tool.touch()
+        runtime = self.root / "runtime"
+        tool_release = {"assets": [{**ASSET, "name": "appimagetool-x86_64.AppImage"}]}
+        runtime_release = {"assets": [{**ASSET, "name": "runtime-x86_64"}]}
+        with (
+            patch("install.latest_release", side_effect=[tool_release, runtime_release]),
+            patch("install.download_asset", side_effect=[tool, runtime]),
+            patch("install.prepare_appdir"),
+            patch("install.subprocess.run", side_effect=subprocess.CalledProcessError(
+                7, "appimagetool", output="Cannot create squashfs: disk full"
+            )),
+        ):
+            with self.assertRaisesRegex(install.InstallError, "Cannot create squashfs: disk full"):
+                install.build_appimage(self.root / "archive", self.root / "logo", self.root, self.root)
+
+    def test_successful_build_hides_verbose_tool_output(self):
+        tool = self.root / "appimagetool"
+        tool.touch()
+        tool_release = {"assets": [{**ASSET, "name": "appimagetool-x86_64.AppImage"}]}
+        runtime_release = {"assets": [{**ASSET, "name": "runtime-x86_64"}]}
+        image = self.root / install.IMAGE_NAME
+
+        def package(*args, **kwargs):
+            image.write_bytes(ELF[:8] + b"AI\x02" + ELF[11:])
+            return subprocess.CompletedProcess(args[0], 0, stdout="Verbose squashfs statistics")
+
+        output = io.StringIO()
+        with (
+            patch("install.console", install.Console(file=output, force_terminal=False)),
+            patch("install.latest_release", side_effect=[tool_release, runtime_release]),
+            patch("install.download_asset", side_effect=[tool, self.root / "runtime"]),
+            patch("install.prepare_appdir"),
+            patch("install.subprocess.run", side_effect=package) as run,
+        ):
+            result = install.build_appimage(self.root / "archive", self.root / "logo", self.root, self.root)
+        self.assertEqual(result, image)
+        self.assertTrue(os.access(result, os.X_OK))
+        self.assertEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(run.call_args.kwargs["stderr"], subprocess.STDOUT)
+        self.assertIn("Compressing AppImage", output.getvalue())
+        self.assertNotIn("Verbose squashfs statistics", output.getvalue())
 
     def test_desktop_exec_escaping(self):
         self.assertEqual(install.desktop_exec('/home/a b/game'), '"/home/a b/game"')
@@ -369,6 +448,54 @@ class InstallTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()) as stderr:
                 self.assertEqual(install.main([]), 1)
             self.assertIn("specific failure", stderr.getvalue())
+
+
+class OutputTests(unittest.TestCase):
+    def test_missing_dependency_explains_environment_setup(self):
+        result = subprocess.run(
+            [sys.executable, "-S", str(Path(install.__file__).resolve()), "--check"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Missing dependency: Rich", result.stderr)
+        self.assertIn("bash install.sh", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_summary_renders_literal_paths_without_terminal_escapes(self):
+        output = io.StringIO()
+        with patch("install.console", install.Console(file=output, force_terminal=False, width=100)):
+            install.show_summary("Ready to play", [
+                ("AppImage", "/tmp/[red]literal[/red]/game.AppImage"),
+                ("Launch mode", "Fullscreen"),
+                ("Save data", "Preserved"),
+            ], style="green")
+        text = output.getvalue()
+        for expected in ("Ready to play", "[red]literal[/red]", "Fullscreen", "Preserved"):
+            self.assertIn(expected, text)
+        self.assertNotIn("\x1b", text)
+
+    def test_no_color_mode_omits_color_sequences(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"NO_COLOR": "1"}):
+            console = install.Console(file=output, force_terminal=True, width=100)
+        with patch("install.console", console):
+            install.show_summary("Release", [("Version", "v1")])
+        self.assertNotIn("\x1b[36m", output.getvalue())
+        self.assertTrue(console.no_color)
+
+    def test_error_panel_preserves_diagnostics_and_failure_exit(self):
+        output = io.StringIO()
+        error = install.InstallError("AppImage build failed (exit 7).\n\n[tool] Disk full")
+        with (
+            patch("install.error_console", install.Console(file=output, force_terminal=False, width=100)),
+            patch("install.install", side_effect=error),
+        ):
+            self.assertEqual(install.main([]), 1)
+        text = output.getvalue()
+        for expected in ("Installation failed", "exit 7", "[tool] Disk full"):
+            self.assertIn(expected, text)
+        self.assertNotIn("Ready to play", text)
+        self.assertNotIn("\x1b", text)
 
 
 if __name__ == "__main__":

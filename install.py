@@ -16,8 +16,30 @@ import sys
 import tarfile
 import tempfile
 from urllib.error import URLError
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from urllib.request import Request, urlopen
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import (
+        BarColumn,
+        DownloadColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeRemainingColumn,
+        TransferSpeedColumn,
+    )
+    from rich.table import Table
+    from rich.text import Text
+except ModuleNotFoundError as error:
+    if error.name != "rich":
+        raise
+    sys.exit(
+        "Missing dependency: Rich. Run the setup helper from this checkout:\n"
+        "  bash install.sh"
+    )
 
 
 GAME_REPO = "actualraptor/extinction-protocol"
@@ -25,10 +47,21 @@ APP_ID = "extinction-protocol"
 APP_NAME = "Extinction Protocol"
 IMAGE_NAME = "Extinction-Protocol.AppImage"
 LOGO_PATH = "native/assets/branding/extinction-protocol-logo.png"
+console = Console(highlight=False)
+error_console = Console(stderr=True, highlight=False)
 
 
 class InstallError(Exception):
     """An actionable installation failure."""
+
+
+def show_summary(title, rows, style="cyan"):
+    table = Table.grid(padding=(0, 2), expand=True)
+    table.add_column(style="dim", no_wrap=True)
+    table.add_column(overflow="fold")
+    for label, value in rows:
+        table.add_row(Text(label), Text(str(value)))
+    console.print(Panel(table, title=title, border_style=style, padding=(1, 2)))
 
 
 def request(url):
@@ -97,22 +130,50 @@ def sha256(path):
 
 
 def download(url, destination, checksum=None):
+    name = unquote(url.rsplit("/", 1)[-1])
     if destination.is_file():
-        if checksum is None or sha256(destination) == checksum:
+        with console.status("Checking cached download...", spinner="dots"):
+            valid = checksum is None or sha256(destination) == checksum
+        if valid:
+            console.print(Text(f"Using cached download: {name}", style="dim"))
             return destination
-        print(f"Discarding corrupt cached download: {destination.name}", file=sys.stderr)
+        error_console.print(
+            Text(f"Cached checksum mismatch; downloading again: {name}", style="yellow")
+        )
         destination.unlink()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {url.rsplit('/', 1)[-1]}...", flush=True)
+    console.print(Text(name, style="bold"))
     # Unique partial files allow separate installations to share the cache.
     with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as target:
         partial = Path(target.name)
         try:
             with request(url) as response:
-                shutil.copyfileobj(response, target)
+                length = response.headers.get("Content-Length")
+                total = int(length) if length is not None else None
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]{task.description}"),
+                    BarColumn(),
+                    DownloadColumn(),
+                    TransferSpeedColumn(),
+                    TimeRemainingColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task("Downloading", total=total)
+                    received = 0
+                    while chunk := response.read(1024 * 1024):
+                        target.write(chunk)
+                        received += len(chunk)
+                        progress.update(task, advance=len(chunk))
+                    if total is not None and received != total:
+                        raise InstallError(f"Incomplete download for {name}: {received} of {total} bytes.")
+                    progress.update(task, total=received, completed=received)
             target.close()
-            if checksum is not None and sha256(partial) != checksum:
-                raise InstallError(f"SHA-256 mismatch for {url.rsplit('/', 1)[-1]}.")
+            if checksum is not None:
+                with console.status("Verifying SHA-256...", spinner="dots"):
+                    if sha256(partial) != checksum:
+                        raise InstallError(f"SHA-256 mismatch for {name}.")
+                console.print("[green]SHA-256 verified[/green]")
             partial.replace(destination)
         finally:
             partial.unlink(missing_ok=True)
@@ -208,26 +269,40 @@ def prepare_appdir(archive, logo, appdir):
 
 
 def build_appimage(archive, logo, work, cache):
-    tool_release = latest_release("AppImage/appimagetool")
-    runtime_release = latest_release("AppImage/type2-runtime")
+    with console.status("Resolving AppImage build tools...", spinner="dots"):
+        tool_release = latest_release("AppImage/appimagetool")
+        runtime_release = latest_release("AppImage/type2-runtime")
     tool_asset = exact_asset(tool_release, "appimagetool-x86_64.AppImage")
     runtime_asset = exact_asset(runtime_release, "runtime-x86_64")
     tool = download_asset(tool_asset, cache, asset_checksum(tool_asset))
     runtime = download_asset(runtime_asset, cache, asset_checksum(runtime_asset))
     tool.chmod(0o755)
     appdir = work / "Extinction-Protocol.AppDir"
-    prepare_appdir(archive, logo, appdir)
+    console.print("\n[bold cyan]Package[/bold cyan]  Preparing the game and fullscreen launcher")
+    with console.status("Extracting and preparing AppDir...", spinner="dots"):
+        prepare_appdir(archive, logo, appdir)
     image = work / IMAGE_NAME
-    print("Building AppImage...", flush=True)
-    subprocess.run(
-        [
-            str(tool), "--appimage-extract-and-run", "--no-appstream",
-            "--runtime-file", str(runtime), str(appdir), str(image),
-        ],
-        check=True,
-        cwd=work,
-        env={**os.environ, "ARCH": "x86_64"},
-    )
+    console.print("[bold cyan]Build[/bold cyan]    Compressing AppImage (this can take a moment)")
+    with console.status("Building AppImage...", spinner="dots"):
+        try:
+            subprocess.run(
+                [
+                    str(tool), "--appimage-extract-and-run", "--no-appstream",
+                    "--runtime-file", str(runtime), str(appdir), str(image),
+                ],
+                check=True,
+                cwd=work,
+                env={**os.environ, "ARCH": "x86_64"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+            )
+        except subprocess.CalledProcessError as error:
+            raise InstallError(
+                f"AppImage build failed (exit {error.returncode}).\n\n"
+                f"{error.stdout or 'No build diagnostics were emitted.'}"
+            ) from error
     with image.open("rb") as result:
         header = result.read(11)
     if header[:4] != b"\x7fELF" or header[8:11] != b"AI\x02":
@@ -264,16 +339,26 @@ def install(args):
     install_dir = args.install_dir.expanduser().resolve()
     data_dir = xdg_path("XDG_DATA_HOME", ".local/share")
     cache = xdg_path("XDG_CACHE_HOME", ".cache") / APP_ID
-    release = latest_release(GAME_REPO)
-    asset = select_game_asset(release["assets"])
-    checksum = asset_checksum(asset, release)
+    console.print(Panel(
+        Text.assemble((APP_NAME, "bold cyan"), "\nLinux AppImage installer"),
+        border_style="cyan", padding=(1, 2),
+    ))
+    with console.status("Finding the latest GitHub release...", spinner="dots"):
+        release = latest_release(GAME_REPO)
+        asset = select_game_asset(release["assets"])
+        checksum = asset_checksum(asset, release)
     identity = {
         "tag": release["tag_name"],
         "asset": asset["name"],
         "sha256": checksum,
     }
-    print(f"Latest release: {identity['tag']} ({asset['name']})")
+    show_summary("Latest GitHub release", [
+        ("Version", identity["tag"]),
+        ("Asset", asset["name"]),
+        ("Destination", install_dir / IMAGE_NAME),
+    ])
     if args.check:
+        console.print("[dim]Check only; no files were changed.[/dim]")
         return
     install_dir.mkdir(parents=True, exist_ok=True)
     with (install_dir / f".{APP_ID}.lock").open("a") as lock:
@@ -312,9 +397,19 @@ def install(args):
         atomic_write(desktop, desktop_entry(desktop_exec(image), icon).encode())
         if shutil.which("update-desktop-database"):
             subprocess.run(["update-desktop-database", str(desktop.parent)], check=True)
-        print(f"{'Already up to date' if current and not args.force else 'Installed'}: {image}")
-        print(f"Launch {APP_NAME} from your application menu.")
-        print("Existing Godot saves and settings were left untouched.")
+        console.print()
+        show_summary(
+            "Already up to date" if current and not args.force else "Ready to play",
+            [
+                ("Version", identity["tag"]),
+                ("AppImage", image),
+                ("Menu entry", desktop),
+                ("Launch mode", "Fullscreen"),
+                ("Save data", "Preserved - existing Godot saves and settings are untouched"),
+            ],
+            style="green",
+        )
+        console.print(f"[bold green]Launch {APP_NAME} from your application menu.[/bold green]")
 
 
 def main(argv=None):
@@ -329,10 +424,10 @@ def main(argv=None):
     try:
         install(args)
     except (InstallError, OSError, URLError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        error_console.print(Panel(Text(str(error)), title="Installation failed", border_style="red"))
         return 1
     except KeyboardInterrupt:
-        print("\nInstallation interrupted.", file=sys.stderr)
+        error_console.print("\n[yellow]Installation interrupted.[/yellow]")
         return 130
     return 0
 
