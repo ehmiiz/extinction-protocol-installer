@@ -1,7 +1,9 @@
 # Extinction Protocol installer
 
 Install the latest [Extinction Protocol](https://github.com/actualraptor/extinction-protocol/releases/latest)
-on **Omarchy / Arch Linux (x86-64)**. Adds an AppImage and application-menu icon,
+on **Omarchy / Arch Linux (x86-64)**.
+
+Adds an AppImage and application-menu icon,
 launches in fullscreen, and leaves your saves untouched.
 
 ## Getting Started
@@ -65,9 +67,6 @@ For a FUSE error, install `fuse2` or launch without it:
 ```sh
 "$HOME/Applications/Extinction-Protocol.AppImage" --appimage-extract-and-run
 ```
-
-The upstream Linux build may be marked **UNVERIFIED**; this installer doesn't fix
-game or graphics-driver issues.
 
 **How do I uninstall?**  
 Open the Omarchy menu (**Super + Alt + Space**), search for **Extinction Protocol**,
